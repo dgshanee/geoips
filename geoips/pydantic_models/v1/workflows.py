@@ -21,6 +21,7 @@ from copy import deepcopy
 import datetime as dt
 from glob import glob
 import logging
+import re
 from typing import Any, Dict, List, Literal, Optional, Union
 
 # Third-Party Libraries
@@ -35,6 +36,7 @@ from pydantic import (
 )
 
 # GeoIPS imports
+from geoips.constants import PLUGIN_PROVIDED
 from geoips import interfaces
 from geoips.config import config
 from geoips.errors import (
@@ -45,6 +47,7 @@ from geoips.pydantic_models.v1.bases import (
     PluginModel,
     FrozenModel,
     PermissiveFrozenModel,
+    PythonIdentifier,
     StepReference,
 )
 from geoips.pydantic_models.v1.algorithms import AlgorithmArgumentsModel
@@ -55,6 +58,7 @@ from geoips.pydantic_models.v1.filename_formatters import (
 from geoips.pydantic_models.v1.interpolators import InterpolatorArgumentsModel
 from geoips.pydantic_models.v1.output_checkers import OutputCheckerArgumentsModel
 from geoips.pydantic_models.v1.readers import ReaderArgumentsModel
+from geoips.pydantic_models.v1.title_formatters import TitleFormatterArgumentsModel
 from geoips.utils.types.partial_lexeme import Lexeme
 
 LOG = logging.getLogger(__name__)
@@ -146,6 +150,16 @@ def get_plugin_kinds() -> set[str]:
         for ifs in interfaces.list_available_interfaces().values()
         for plugin_kinds in ifs
     }
+
+
+def _product_step_id(name: list[str]) -> str:
+    """Build a valid PythonIdentifier step ID from a product name tuple.
+
+    Joins the name segments with ``"_"`` then replaces any remaining
+    non-identifier characters with ``"_"``, ensuring the result satisfies
+    ``str.isidentifier()``.
+    """
+    return re.sub(r"[^a-zA-Z0-9_]", "_", "_".join(name))
 
 
 # NOTE: We need to move all of the argument models to their own module once implemented
@@ -248,6 +262,7 @@ _PLUGIN_ARGUMENTS_MODELS: dict[str, type] = {
     "ProductArgumentsModel": ProductArgumentsModel,
     "ReaderArgumentsModel": ReaderArgumentsModel,
     "SectorArgumentsModel": SectorArgumentsModel,
+    "TitleFormatterArgumentsModel": TitleFormatterArgumentsModel,
     "WorkflowArgumentsModel": WorkflowArgumentsModel,
 }
 
@@ -262,6 +277,7 @@ class GlobalVariablesModel(PermissiveFrozenModel):
     presectoring toggle)
     """
 
+    minimum_coverage: float | str = Field(default=PLUGIN_PROVIDED)
     presector: bool = Field(
         False,
         description="Specify whether to presector the data prior to applying "
@@ -488,6 +504,9 @@ class WorkflowStepDefinitionModel(FrozenModel):
         ValueError
             If the plugin name is not valid for the specified plugin kind.
         """
+        if not isinstance(values, dict):
+            return values
+
         if values.get("kind") == "workflow":
             if (values.get("name") is None) == (values.get("spec") is None):
                 raise ValueError("Exactly one of name or spec must be provided.")
@@ -665,7 +684,7 @@ class WorkflowSpecModel(FrozenModel):
         None,
         description="Arguments shared across workflow steps",
     )
-    steps: Dict[str, Union[WorkflowStepDefinitionModel]] = Field(
+    steps: Dict[PythonIdentifier, WorkflowStepDefinitionModel] = Field(
         ..., description="Steps to produce the workflow."
     )
 
@@ -789,10 +808,10 @@ class WorkflowSpecModel(FrozenModel):
         family = plugin.get("family")
         spec = plugin.get("spec", {})
         global_vars = {"variables": spec["variables"]} if spec.get("variables") else {}
+        last_data_step = []
 
         if family in ORDERED_PRODUCT_FAMILIES:
             step_order = family.split("_")
-            last_data_step = []
             for idx, plugin_name in enumerate(step_order):
                 steps[plugin_name] = spec[plugin_name].get("plugin")
                 steps[plugin_name]["kind"] = plugin_name
@@ -824,6 +843,17 @@ class WorkflowSpecModel(FrozenModel):
 
                 steps[key] = value.get("plugin")
                 steps[key]["kind"] = kind
+                if kind not in ("colormapper", "output_formatter"):
+                    last_data_step = [key]
+
+        if "coverage_checker" not in list(steps.keys()):
+            # Add default coverage checker step if one doesn't already exist
+            steps["coverage_checker"] = {
+                "kind": "coverage_checker",
+                "name": "masked_arrays",
+                "depends_on": last_data_step,
+                "arguments": {"minimum_coverage": 10},
+            }
 
         return steps, global_vars
 
@@ -899,19 +929,27 @@ class WorkflowSpecModel(FrozenModel):
         _inputs = None
 
         for name, step in steps.items():
+            if not isinstance(step, dict):
+                expanded_steps[name] = step
+                _inputs = [name]
+                continue
             # Default
             if step.get("kind") in ["product", "product_default"]:
+                if step.get("depends_on"):
+                    _inputs = step["depends_on"]
                 spec = {"steps": cls.expand_step(step, info, _inputs)}
                 new_step = {
                     "kind": "workflow",
                     "spec": spec,
                 }
+                if step.get("depends_on"):
+                    new_step["depends_on"] = step["depends_on"]
                 # Generate a step ID based off the current step's plugin name.
                 # For products, join the name tuple with "_" and replace any
                 # remaining non-identifier characters so the result is always
                 # a valid PythonIdentifier (required by depends_on validation).
                 step_id = (
-                    "_".join(step.get("name"))
+                    _product_step_id(step.get("name"))
                     if step.get("kind") == "product"
                     else step.get("name")
                 )
@@ -935,9 +973,11 @@ class WorkflowSpecModel(FrozenModel):
 
         mapping = {}
         for name, step in steps.items():
+            if not isinstance(step, dict):
+                continue
             if step.get("kind") in ("product", "product_default"):
                 step_id = (
-                    "_".join(step.get("name"))
+                    _product_step_id(step.get("name"))
                     if step.get("kind") == "product"
                     else step.get("name")
                 )
@@ -977,6 +1017,8 @@ class WorkflowSpecModel(FrozenModel):
 
         for i, sid in enumerate(step_ids):
             step = steps[sid]
+            if not isinstance(step, dict):
+                continue
             if step.get("depends_on") is None:
                 step["depends_on"] = [] if i == 0 else [step_ids[i - 1]]
 
@@ -1289,7 +1331,7 @@ class WorkflowPluginModel(PluginModel):
     test: WorkflowTestModel = Field(
         None,
         description=(
-            "An optional dictionary of parameters used to test this workflow.",
+            "An optional dictionary of parameters used to test this workflow."
         ),
         examples=[
             {
